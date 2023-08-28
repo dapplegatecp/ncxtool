@@ -81,24 +81,79 @@ class Ncm:
         jwt = self._get_jwt()
         self.ncm_api_account = self._get_accountId()
         self.ncm_tenant_id = self._get_tenantId()
+        self.ncm_user_id = self._get_userId()
+        LOGGER.info(f"Account: {self.ncm_api_account}, Tenant: {self.ncm_tenant_id}, User: {self.ncm_user_id}")
         # self.ncm_api_account = 113114
         # self.ncm_tenant_id = "0016u00000FVFEp"
     
     def get_jwt(self):
         return self._get_jwt()
 
-    def license(self, nce_macs):
+    def get(self, url):
+        r = self.session.get(url)
+        if not r.ok:
+            LOGGER.error(f'GET {url} failed with status code {r.status_code}: {r.text}')
+            return None
+        return r.json()
+
+    def get_collaborations(self):
+        params = {'expand': 'collaborationTenants,tenant'}
+        r = self.session.get(self.ncm_auth_url + '/api/internal/v2/origin_users/%s' % self.ncm_user_id, params=params)
+        if not r.ok:
+            LOGGER.error(f'GET {self.ncm_auth_url + "/api/internal/v2/origin_users/%s" % self.ncm_user_id} failed with status code {r.status_code}: {r.text}')
+            return None
+        return r.json()['included']
+
+    def switch_user(self, tenant_id, save=True):
+        params = {'filter[userExternalId]': self.ncm_user_id, 'filter[tenantId]': tenant_id}
+        r = self.session.get(self.ncm_auth_url + '/api/internal/v2/collaborations', params=params)
+        if not r.ok:
+            LOGGER.error(f'GET {self.ncm_auth_url + "/api/internal/v2/collaborations"} failed with status code {r.status_code}: {r.text}')
+            return None
+        collab_id = r.json()['data'][0]['id']
+
+        payload = {
+            "data": {
+                "type": "credentialExchange",
+                "attributes": {
+                "exchangeType": "COLLABORATION",
+                "collaborationId": collab_id
+                }
+            }
+            }
+        r = self.session.post(self.ncm_auth_url + '/api/internal/v2/credentialExchange', json=payload)
+        LOGGER.info(f'post response: {r.json()}')
+        try:
+            state = r.json()['data']['attributes']['state']
+            token = r.json()['data']['attributes']['token']
+        except KeyError:
+            LOGGER.error("Failed to get the state and token")
+            return
+        curr_jwt = self._oidc_authorize(state)
+        if save:
+            self._save_jwt_to_file(curr_jwt)
+        return curr_jwt
+
+
+    def license(self, nce_macs, product_name="3200v", add_on=None, tries=2):
+        if tries <= 0:
+            LOGGER.error("Failed to add license after 2 tries")
+            return False
         params = {'parentAccount': self.ncm_api_account, 'accountId': self.ncm_api_account}
 
-        add_on_lst = ["NCX-SCM", "NCX-SDWAN"]
+        add_on_lst = {
+            "3200v": ["NCX-SCM", "NCX-SDWAN"],
+            "IBR900": ["NCX-SCIOT", "NCX-SDWAN-TRIAL"],
+            "IBR1700": ["NCX-SCS", "NCX-SDWAN-TRIAL"], 
+        }
         #Netcloud Exchange Secure Connect - Medium site add-on license and NetCloud Exchange SD-WAN
         for nce_mac in nce_macs:
-            for add_on in add_on_lst:
+            for add_on in ([add_on] if add_on else add_on_lst[product_name]):
                 payload = {
                     "data": {
                         "attributes" : {
                             "tenantId" : self.ncm_tenant_id,
-                            "productName" : "3200v",
+                            "productName" : product_name,
                             "ncmAccountList" : [],
                             "groupList" : [],
                             "includedMacList" : [nce_mac],
@@ -117,6 +172,11 @@ class Ncm:
                 r = self.session.post(self.ncm_api_license_addon_url + '/tasks/bulkRegrade', params=params, json=payload)
                 LOGGER.debug(f"License add request response json for mac {nce_mac}......{r.json()}")
                 if not r.ok:
+                    if r.status_code == 409:
+                        LOGGER.info(f"Retry on conflict for mac {nce_mac} and add-on {add_on}")
+                        time.sleep(2)
+                        self.license(nce_macs=[nce_mac], product_name=product_name, add_on=add_on, tries=tries-1)
+                        continue
                     LOGGER.info(f"Failed to add ncx license at Post stage for NCE with mac {nce_mac} {r.status_code} {r.text}")
                     return False
                 addon_id = r.json().get("data").get("id")
@@ -315,7 +375,7 @@ class Ncm:
         
         self.deploy_network()
 
-    def get_sites(self, nid=None):
+    def get_sites(self, sid=None, nid=None):
         if not nid:
             LOGGER.info("NID empty")
             nid = self.get_network_id()
@@ -323,6 +383,10 @@ class Ncm:
                 raise Exception("No network found")
 
         params = {'filter[network_id]':nid, 'parentAccount': self.ncm_api_account, 'tenantId' : self.ncm_tenant_id}
+        if sid:
+            if not isinstance(sid, list):
+                sid = [sid]
+            params['filter[id]'] = ",".join(sid)
         r = self.session.get(self.ncm_api_networks_url + '/sites', params=params)
         return r.json()['data']
 
@@ -767,8 +831,15 @@ class Ncm:
             LOGGER.error("Failed to get the state and token")
             return
 
+        curr_jwt = self._oidc_authorize(state, redirect_url=self.ncm_auth_url)
+        self._save_jwt_to_file(curr_jwt)
+        return curr_jwt
+
+    def _oidc_authorize(self, state, redirect_url = None):
+        params = {'state': state}
+        if redirect_url:
+            params['redirect_url'] = redirect_url
         #API2 - Authorize
-        params = {'state': state, 'redirect_url': self.ncm_auth_url}
         r2 = self.session.get(self.ncm_auth_url + '/api/internal/v1/users/oidc_authorize', params=params, allow_redirects=False)
        
         loc = ''
@@ -780,6 +851,15 @@ class Ncm:
         LOGGER.info("Got Jwt Authorization")
 
         #API3 - Callback
+        data = {
+            "data": {
+                "type": "login",
+                "attributes": {
+                    "email": self.username,
+                    "password": self.password
+                }
+            }                
+        }
         url3 = loc
         r3 = self.session.get(url3, data=data, allow_redirects=False)
         if not r3.ok:
@@ -792,7 +872,6 @@ class Ncm:
         except KeyError:
             LOGGER.error('Jwt key not in cookies %s', r3.cookies)
             return
-        self._save_jwt_to_file(curr_jwt)
         return curr_jwt
 
     def _load_jwt_from_file(self):
@@ -813,7 +892,8 @@ class Ncm:
             f.write(json.dumps({'jwt': jwt, 'ts': time.time()}))
 
     def _get_accountId(self):
-        payload = {'login': self.username, 'password': self.password}
+        # payload = {'login': self.username, 'password': self.password}
+        payload = {}
         r = self.session.get(self.ncm_api_url +'/accounts', data=payload)
         if not r.ok:
             LOGGER.error('Failed trying to query accountId (%s) %s', r.status_code, r.text)
@@ -826,7 +906,8 @@ class Ncm:
         return aid
 
     def _get_tenantId(self):
-        payload = {'login': self.username, 'password': self.password}
+        # payload = {'login': self.username, 'password': self.password}
+        payload = {}
         r = self.session.get(self.ncm_api_url + '/customers/?parentAccount=%s' % (self.ncm_api_account), data=payload)
         if not r.ok:
             LOGGER.error('Failed trying to query tenantId (%s) %s', r.status_code, r.text)
@@ -838,6 +919,17 @@ class Ncm:
             return
         return tid
 
+    def _get_userId(self):
+        r = self.session.get(self.ncm_auth_url + '/api/v1/users/self')
+        if not r.ok:
+            LOGGER.error('Failed trying to query userId (%s) %s', r.status_code, r.text)
+            return
+        try:
+            uid = r.json()['data']['id']
+        except KeyError:
+            LOGGER.error('Failed to get userId for %s' % self.username)
+            return
+        return uid
 
 
 if __name__=="__main__":
@@ -846,14 +938,20 @@ if __name__=="__main__":
     parser.add_argument('-v', action='count', default=0, help="verbosity, -v is warn -vv is info -vvv is debug")
     parser.add_argument('-l', help="NCM login info. Must be in format username:password")
     parser.add_argument('-s', help="mystack namespace or qa4, or pass in '' for prod (default).", default="")
+    parser.add_argument('-a', help="Execute as a collaborator, pass in collaborator tenant id")
     subparsers = parser.add_subparsers(dest='cmd')
 
     # parser for jwt command
     parser_jwt = subparsers.add_parser('jwt', help='get a jwt')
 
+    # parser for get command
+    parser_get = subparsers.add_parser('get', help='call get against raw ncm api url')
+    parser_get.add_argument(dest='url', help="url to call")
+
     # parser for license command
     parser_lic = subparsers.add_parser('license', help='license mac adders')
     parser_lic.add_argument(dest='macs', nargs='+', help="mac addrs to register")
+    parser_lic.add_argument(dest="product", help="product to register", default="3200v")
 
     # parser for get_network command
     parser_gnet = subparsers.add_parser('get_network', help='get a network')
@@ -940,6 +1038,13 @@ if __name__=="__main__":
     parser_gua = subparsers.add_parser('get_user_attributes', help="get user attributes")
     parser_gua.add_argument(dest="network_id", nargs="?")
 
+    # parser for get collaborations
+    parser_gcol = subparsers.add_parser('get_collaborations', help="get collaborations")
+
+    # parser for switch user
+    parser_suser = subparsers.add_parser('switch_user', help="switch user")
+    parser_suser.add_argument(dest="tenant_id")
+
     args = parser.parse_args()
 
     lvl = logging.ERROR
@@ -952,11 +1057,17 @@ if __name__=="__main__":
     LOGGER.info(f"Username:{username} Password:{password}")
     ncm = Ncm(username, password, stack=args.s)
 
+    if args.a:
+        ncm.switch_user(tenant_id=args.a, save=False)
+
     if args.cmd == "jwt":
         print(ncm.get_jwt())
     
+    if args.cmd == "get":
+        print(json.dumps(ncm.get(args.url)))
+    
     if args.cmd == "license":
-        ncm.license(args.macs)
+        ncm.license(args.macs, product_name=args.product)
     
     if args.cmd == "get_network":
         print(json.dumps(ncm.get_network()))
@@ -1029,3 +1140,9 @@ if __name__=="__main__":
     
     if args.cmd == "get_user_attributes":
         print(json.dumps(ncm.get_user_attributes(nid=args.network_id)))
+    
+    if args.cmd == "get_collaborations":
+        print(json.dumps(ncm.get_collaborations()))
+    
+    if args.cmd == "switch_user":
+        print(json.dumps(ncm.switch_user(tenant_id=args.tenant_id)))
