@@ -11,6 +11,7 @@ import select
 import sys
 import time
 import uuid
+import os
 from functools import partial
 
 import requests
@@ -1114,8 +1115,13 @@ if __name__=="__main__":
     if args.v == 2: lvl = logging.INFO
     if args.v >= 3: lvl = logging.DEBUG
     LOGGER.setLevel(level=lvl)
-
-    username, password = args.l.split(":")
+    try:
+        username, password = args.l.split(":")
+    except AttributeError:
+        username = os.environ.get("NCM_USERNAME")
+        password = os.environ.get("NCM_PASSWORD")
+    if not username or not password:
+        raise Exception("Must provide username and password, either by using -l or setting NCM_USERNAME and NCM_PASSWORD environment variables")
     LOGGER.info(f"Username:{username} Password:{password}")
     ncm = Ncm(username, password, stack=args.s)
 
