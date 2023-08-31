@@ -3,13 +3,18 @@
 __version__ = '0.1.2'
 
 import argparse
-import logging
-import requests
+import html
 import json
-import time
+import logging
+import random
+import select
 import sys
+import time
 import uuid
 from functools import partial
+
+import requests
+
 
 class CustomFormatter(logging.Formatter):
     """Logging colored formatter, adapted from https://stackoverflow.com/a/56944256/3638629"""
@@ -135,16 +140,25 @@ class Ncm:
         return curr_jwt
 
 
-    def license(self, nce_macs, product_name="3200v", add_on=None, tries=2):
+    def license(self, nce_macs, product_name="3200v", trial=False, add_on=None, tries=2):
         if tries <= 0:
             LOGGER.error("Failed to add license after 2 tries")
             return False
         params = {'parentAccount': self.ncm_api_account, 'accountId': self.ncm_api_account}
 
+        ncx_sdwan = f"NCX-SDWAN{'-TRIAL' if trial else ''}"
+        ncx_medium = ["NCX-SCM", ncx_sdwan]
+        ncx_iot = ["NCX-SCIOT", ncx_sdwan]
+        ncx_small = ["NCX-SCS", ncx_sdwan]
+        ncx_large = ["NCX-SCL", ncx_sdwan]
         add_on_lst = {
-            "3200v": ["NCX-SCM", "NCX-SDWAN"],
-            "IBR900": ["NCX-SCIOT", "NCX-SDWAN-TRIAL"],
-            "IBR1700": ["NCX-SCS", "NCX-SDWAN-TRIAL"], 
+            "3200v": ncx_medium,
+            "IBR900": ncx_iot,
+            "IBR1700": ncx_small,
+            "AER2200": ncx_medium,
+            "E300": ncx_medium,
+            "E3000": ncx_large,
+            "R1900": ncx_large
         }
         #Netcloud Exchange Secure Connect - Medium site add-on license and NetCloud Exchange SD-WAN
         for nce_mac in nce_macs:
@@ -457,7 +471,7 @@ class Ncm:
 
         return r.json().get("data", [])
 
-    def add_resource(self, site_id, resource_name, resource_type, resource_protocols, resource_port_ranges, resource_ip, resource_domain, nid=None):
+    def add_resource(self, site_id, resource_name, resource_type, resource_protocols, resource_port_ranges, resource_ip, resource_domain, resource_static_prime_ip=None, resource_static_prime_ip_pool=None, nid=None):
         if not nid:
             LOGGER.info("NID empty")
             nid = self.get_network_id()
@@ -481,6 +495,8 @@ class Ncm:
                   "port_ranges":port_ranges(resource_port_ranges),
                   "domain":resource_domain,
                   "ip":resource_ip,
+                  "static_prime_ip": resource_static_prime_ip,
+                  "static_prime_ip_pool": resource_static_prime_ip_pool,
                   "name":resource_name,
                   "tags":[],
                   "site_id":site_id,
@@ -489,8 +505,8 @@ class Ncm:
         LOGGER.info("Adding resource: %s", data)
         r = self.session.post(self.ncm_api_policy_config_url+'/resources', params=params, json=data)
         if not r.ok:
-            LOGGER.error("Failed to add resource (%s) (%s)", r.status_code, r.json())
-            raise Exception("Failed to add resource (%s) (%s)", r.status_code, r.json())
+            LOGGER.error("Failed to add resource (%s) (%s)", r.status_code, r.text)
+            raise Exception("Failed to add resource (%s) (%s)", r.status_code, r.text)
     
         return r.json().get("data", [])
     
@@ -779,6 +795,45 @@ class Ncm:
         r = self.session.get(self.ncm_api_ncx_auth_url+'/user_attributes', params=params)
         return r.json().get('data', [])
 
+    def remote_connect(self, rtr_id):
+        s_id = random.randint(100000000, 999999999)
+        ncm_api = f"https://www.cradlepointecm.com/api/v1/remote/control/csterm/term-{s_id}?id={rtr_id}"
+
+        # initial = {"k":"","w":120,"h":32,"u":"dapplegate@cradlepoint.com"}
+        initial = {"k":""}
+        print(f"Connecting to {rtr_id}...")
+        r = self.session.put(ncm_api, json=initial, headers={"Content-Type": "application/json"})
+        r.raise_for_status()
+        print(r.json()['data'][0]['data']['k'], end='', flush=True)
+        while True:
+            echo = True
+            kill = False
+            try:
+                c, *_ = select.select( [sys.stdin], [], [], 1 )
+                if not c:
+                    c =''
+                    echo = False
+                else:
+                    c = sys.stdin.readline()
+                    if not c: #eof?
+                        raise EOFError
+                    c = c.strip() + "\r\n"
+
+            except EOFError:
+                c = '\x04'
+                kill = True
+            except KeyboardInterrupt:
+                c = '\x03'
+
+            r = self.session.put(ncm_api, json={'k':c}, headers={"Content-Type": "application/json"})
+            d = html.unescape(r.json()['data'][0]['data']['k'])
+            if echo:
+                d = "\n".join(d.splitlines()[1:-1])
+            print(d, end='', flush=True)
+            if kill:
+                print("Exiting...")
+                break
+
     def _is_mystack(self, stack):
         ncm_auth_url = 'https://accounts-' + stack +'.ncm.public.aws.cradlepointecm.com'
         try:
@@ -950,8 +1005,9 @@ if __name__=="__main__":
 
     # parser for license command
     parser_lic = subparsers.add_parser('license', help='license mac adders')
-    parser_lic.add_argument(dest='macs', nargs='+', help="mac addrs to register")
-    parser_lic.add_argument(dest="product", help="product to register", default="3200v")
+    parser_lic.add_argument("--mac", dest='macs', nargs='+', help="mac addrs to register")
+    parser_lic.add_argument("--product", dest="product", help="product to register", default="3200v")
+    parser_lic.add_argument("--trial", dest="trial", action="store_true")
 
     # parser for get_network command
     parser_gnet = subparsers.add_parser('get_network', help='get a network')
@@ -1003,6 +1059,8 @@ if __name__=="__main__":
     parser_ares.add_argument('--protocols', dest="protocols", nargs="?", default=None)
     parser_ares.add_argument('--port_ranges', dest="port_ranges", nargs="?", default=None)
     parser_ares.add_argument('--ip', dest="ip", nargs="?", default=None)
+    parser_ares.add_argument('--static_prime_ip', dest="static_prime_ip", nargs="?", default=None)
+    parser_ares.add_argument('--static_prime_ip_pool', dest="static_prime_ip_pool", nargs="?", default=None)
     parser_ares.add_argument('--domain',dest="domain", nargs="?", default="example.com")
     # type can be: fqdn_resources, ipsubnet_resource, wildcard_fqdn_resources
 
@@ -1045,6 +1103,10 @@ if __name__=="__main__":
     parser_suser = subparsers.add_parser('switch_user', help="switch user")
     parser_suser.add_argument(dest="tenant_id")
 
+    # parser for remote connect
+    parser_rcon = subparsers.add_parser('remote_connect', help="remote connect")
+    parser_rcon.add_argument(dest="router_id")
+
     args = parser.parse_args()
 
     lvl = logging.ERROR
@@ -1067,7 +1129,7 @@ if __name__=="__main__":
         print(json.dumps(ncm.get(args.url)))
     
     if args.cmd == "license":
-        ncm.license(args.macs, product_name=args.product)
+        ncm.license(args.macs, product_name=args.product, trial=args.trial)
     
     if args.cmd == "get_network":
         print(json.dumps(ncm.get_network()))
@@ -1112,6 +1174,8 @@ if __name__=="__main__":
             resource_protocols=args.protocols, 
             resource_port_ranges=args.port_ranges, 
             resource_ip=args.ip,
+            resource_static_prime_ip=args.static_prime_ip,
+            resource_static_prime_ip_pool=args.static_prime_ip_pool,
             resource_domain=args.domain))
 
     if args.cmd == "delete_resource":
@@ -1146,3 +1210,6 @@ if __name__=="__main__":
     
     if args.cmd == "switch_user":
         print(json.dumps(ncm.switch_user(tenant_id=args.tenant_id)))
+    
+    if args.cmd == "remote_connect":
+        ncm.remote_connect(rtr_id=args.router_id)
