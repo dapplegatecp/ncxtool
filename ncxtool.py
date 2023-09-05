@@ -10,6 +10,7 @@ import random
 import select
 import sys
 import time
+import datetime
 import uuid
 import os
 from functools import partial
@@ -138,6 +139,11 @@ class Ncm:
         curr_jwt = self._oidc_authorize(state)
         if save:
             self._save_jwt_to_file(curr_jwt)
+        
+        self.ncm_api_account = self._get_accountId()
+        self.ncm_tenant_id = self._get_tenantId()
+        LOGGER.info(f"Switch User: {self.ncm_api_account}, Tenant: {self.ncm_tenant_id}")
+
         return curr_jwt
 
 
@@ -835,6 +841,21 @@ class Ncm:
                 print("Exiting...")
                 break
 
+    def logs(self, router_id, format='txt'):
+        r = self.session.get('https://www.cradlepointecm.com/api/v1/remote/status/log/', params={'id': router_id})
+        if format == 'json':
+            return r.json()['data'][0]['data']
+        else:
+            header= ['timestamp', 'level', 'system', 'message']
+            print(", ".join(header))
+            for l in r.json()['data'][0]['data']:
+                timestamp = str(datetime.datetime.fromtimestamp(l[0]))
+                level = l[1]
+                system = l[2]
+                message = l[3]
+                print(", ".join([timestamp, level, system, message]))
+        return r.text
+
     def _is_mystack(self, stack):
         ncm_auth_url = 'https://accounts-' + stack +'.ncm.public.aws.cradlepointecm.com'
         try:
@@ -1108,6 +1129,10 @@ if __name__=="__main__":
     parser_rcon = subparsers.add_parser('remote_connect', help="remote connect")
     parser_rcon.add_argument(dest="router_id")
 
+    # parser for logs
+    parser_logs = subparsers.add_parser('logs', help="logs")
+    parser_logs.add_argument(dest="router_id")
+
     args = parser.parse_args()
 
     lvl = logging.ERROR
@@ -1219,3 +1244,6 @@ if __name__=="__main__":
     
     if args.cmd == "remote_connect":
         ncm.remote_connect(rtr_id=args.router_id)
+    
+    if args.cmd == "logs":
+        ncm.logs(router_id=args.router_id)
