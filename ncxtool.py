@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-__version__ = '0.1.3'
+__version__ = '0.1.4'
 
 import argparse
 import html
@@ -147,7 +147,7 @@ class Ncm:
         return curr_jwt
 
 
-    def license(self, nce_macs, product_name="3200v", trial=False, add_on=None, tries=2):
+    def license(self, nce_macs, product_name="3200v", trial=False, downgrade=False, add_on=None, tries=2):
         if tries <= 0:
             LOGGER.error("Failed to add license after 2 tries")
             return False
@@ -178,7 +178,7 @@ class Ncm:
                             "ncmAccountList" : [],
                             "groupList" : [],
                             "includedMacList" : [nce_mac],
-                            "regradeOperation" : "UPGRADE",
+                            "regradeOperation" : "DOWNGRADE" if downgrade else "UPGRADE",
                             "status" : None,
                             "message" : None,
                             "createdDate" : None,
@@ -407,14 +407,14 @@ class Ncm:
 
         return siteid
 
-    def delete_single_site(self, siteid):
+    def delete_single_site(self, siteid, nid=None):
         params = {'parentAccount': self.ncm_api_account, 'tenantId' : self.ncm_tenant_id}
         r = self.session.delete(self.ncm_api_networks_url + '/sites/%s'%siteid, params=params)
         if not r.ok:
             LOGGER.error("Failed to delete site (%s) for %s", r.status_code, siteid)
             raise Exception("Failed to delete site (%s) for %s", r.status_code, siteid)
         
-        self.deploy_network()
+        self.deploy_network(nid=nid)
 
     def get_sites(self, sid=None, nid=None):
         if not nid:
