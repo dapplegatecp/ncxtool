@@ -1,19 +1,19 @@
 #!/usr/bin/env python
 
-__version__ = '0.1.2'
+__version__ = '0.1.3'
 
 import argparse
 import html
 import json
 import logging
 import random
-import select
 import sys
 import time
 import datetime
 import uuid
 import os
 from functools import partial
+import re
 
 import requests
 
@@ -48,7 +48,7 @@ LOGGER = logging.getLogger()
 # Define format for logs
 fmt = '%(asctime)s | %(levelname)8s | %(message)s'
 
-# Create stdout handler for logging to the console (logs all five levels)
+# Create stderr handler for logging to the console (logs all five levels)
 stdout_handler = logging.StreamHandler()
 stdout_handler.setFormatter(CustomFormatter(fmt))
 
@@ -111,7 +111,7 @@ class Ncm:
             return None
         return r.json()['included']
 
-    def switch_user(self, tenant_id, save=True):
+    def switch_user(self, tenant_id, save=False):
         params = {'filter[userExternalId]': self.ncm_user_id, 'filter[tenantId]': tenant_id}
         r = self.session.get(self.ncm_auth_url + '/api/internal/v2/collaborations', params=params)
         if not r.ok:
@@ -206,6 +206,14 @@ class Ncm:
                     LOGGER.info(f"Failed to add ncx license at Options stage for NCE with mac {nce_mac} {options_req.status_code} {options_req.text}")
                     return False
         return True
+    
+    def get_networks(self):
+        r = self.session.get(self.ncm_api_networks_url + '/networks')
+        rval = []
+        for net in r.json()["data"]:
+            if net["type"] == "networks":
+                rval.append(net)
+        return rval
 
     def get_network(self):
         # networks
@@ -322,27 +330,35 @@ class Ncm:
             LOGGER.info("Network deleted %s", nid)
         return True
 
-    def add_sites(self, site_name_pfx, rtr_ids, nid=None):
+    def add_sites(self, site_name_pfx, rtr_ids, lan_ips=None, local_domains=None, nid=None):
         if not nid:
             LOGGER.info("NID empty")
             nid = self.get_network_id()
             if not nid:
                 raise Exception("No network found")
 
+        if not isinstance(site_name_pfx, list):
+            site_name_pfx = [f"{site_name_pfx}{i if i else ''}" for i in range(len(rtr_ids))]
+        
+        if lan_ips and not local_domains:
+            local_domains = self._string_to_domain(site_name_pfx[0])
+        
+        if local_domains and not isinstance(local_domains, list):
+            local_domains = [self._string_to_domain(f"{i if i else ''}{local_domains}") for i in range(len(rtr_ids))]
+        
+        if lan_ips and not isinstance(lan_ips, list):
+            lan_ips = [lan_ips] * len(rtr_ids)
+
         site_ids = []
-        for i, rtr_id in enumerate(rtr_ids):
-            if i == 0:
-                site_name = site_name_pfx
-            else:
-                site_name = f"{site_name_pfx}{i}"
-            site_ids.append(self.add_single_site(nid=nid, site_name=site_name, rtr_id=rtr_id))
+        for site_name, rtr_id, local_domain, lan_ip in zip(site_name_pfx, rtr_ids, local_domains, lan_ips):
+            site_ids.append(self.add_single_site(nid=nid, site_name=site_name, rtr_id=rtr_id, lan_ip=lan_ip, local_domain=local_domain))
 
         self.deploy_network(nid)
     
         return site_ids
 
 
-    def add_single_site(self, nid=None, site_name=None, rtr_id=None):
+    def add_single_site(self, nid=None, site_name=None, rtr_id=None, local_domain=None, lan_ip=None):
         if not nid:
             LOGGER.info("NID empty")
             nid = self.get_network_id()
@@ -371,6 +387,10 @@ class Ncm:
                                 "type": "sites"
                         }
                 }
+        if local_domain and lan_ip:
+            payload['data']['attributes']['lan_as_dns'] = True
+            payload['data']['attributes']['local_domain'] = local_domain
+            payload['data']['attributes']['primary_dns'] = lan_ip
 
         LOGGER.info(payload)
 
@@ -803,43 +823,58 @@ class Ncm:
         return r.json().get('data', [])
 
     def remote_connect(self, rtr_id):
+        try:
+            from blessed import Terminal
+        except ImportError:
+            LOGGER.error("Please install blessed to use remote connect (pip3 install blessed)")
+            return
+
         s_id = random.randint(100000000, 999999999)
         ncm_api = f"https://www.cradlepointecm.com/api/v1/remote/control/csterm/term-{s_id}?id={rtr_id}"
 
-        # initial = {"k":"","w":120,"h":32,"u":"dapplegate@cradlepoint.com"}
         initial = {"k":""}
-        print(f"Connecting to {rtr_id}...")
-        r = self.session.put(ncm_api, json=initial, headers={"Content-Type": "application/json"})
+        print(f"Connecting to {rtr_id} (ctrl+d to quit)...")
+        r = self.session.put(ncm_api, json=initial, headers={"Content-Type":"application/json"})
         r.raise_for_status()
+
+        term = Terminal()
+
         print(r.json()['data'][0]['data']['k'], end='', flush=True)
-        while True:
-            echo = True
-            kill = False
-            try:
-                c, *_ = select.select( [sys.stdin], [], [], 1 )
-                if not c:
-                    c =''
-                    echo = False
-                else:
-                    c = sys.stdin.readline()
-                    if not c: #eof?
-                        raise EOFError
-                    c = c.strip() + "\r\n"
 
-            except EOFError:
-                c = '\x04'
-                kill = True
-            except KeyboardInterrupt:
-                c = '\x03'
+        with term.cbreak():
+            interrupt = False
+            while True:
+                kill = False
 
-            r = self.session.put(ncm_api, json={'k':c}, headers={"Content-Type": "application/json"})
-            d = html.unescape(r.json()['data'][0]['data']['k'])
-            if echo:
-                d = "\n".join(d.splitlines()[1:-1])
-            print(d, end='', flush=True)
-            if kill:
-                print("Exiting...")
-                break
+                c = ""
+                try:
+                    while True:
+                        if interrupt:
+                            c = '\x03'
+                            interrupt = False
+                            break
+                        i = term.inkey(timeout=0.1)
+                        if '\x04' in i:
+                            kill = True
+                            break
+                        if not i:
+                            break
+                        c += i
+                    if kill:
+                        break
+                    r = self.session.put(ncm_api, json={'k':c}, headers={"Content-Type":"application/json"})
+                    r.raise_for_status()
+
+                    data = r.json()['data'][0]
+                    if not data['success']:
+                        raise Exception(data['reason'])
+                    d = html.unescape(data['data']['k'])
+
+                    if d:
+                        print(d, end='', flush=True)
+                except KeyboardInterrupt:
+                    interrupt = True
+        print("\nExiting...")
 
     def logs(self, router_id, format='txt'):
         r = self.session.get('https://www.cradlepointecm.com/api/v1/remote/status/log/', params={'id': router_id})
@@ -855,6 +890,16 @@ class Ncm:
                 message = l[3]
                 print(", ".join([timestamp, level, system, message]))
         return r.text
+
+    def routers(self, format='txt'):
+        r = self.session.get('https://www.cradlepointecm.com/api/v1/routers/?expand=group,product&limit=500')
+        if format == 'json':
+            return r.json()['data']
+        else:
+            print("router_id,name,group,product")
+            for router in r.json()['data']:
+                print(f"{router['id']},{router['name']},{router['group']['name'] if router.get('group') else ''},{router['product']['name'] if router.get('product') else ''}")
+
 
     def _is_mystack(self, stack):
         ncm_auth_url = 'https://accounts-' + stack +'.ncm.public.aws.cradlepointecm.com'
@@ -1008,6 +1053,28 @@ class Ncm:
             return
         return uid
 
+    def _string_to_domain(self, input_string, max_length=63, separator='-'):
+        # Remove non-alphanumeric characters (except hyphens and periods)
+        input_string = re.sub(r'[^a-zA-Z0-9.-]', '', input_string)
+        
+        # Convert to lowercase
+        input_string = input_string.lower()
+        
+        # Replace spaces with the specified separator (default is hyphen)
+        input_string = input_string.replace(' ', separator)
+        
+        # Trim and ensure domain name meets length requirements
+        if len(input_string) > max_length:
+            input_string = input_string[:max_length]
+        
+        # Remove leading/trailing separator characters
+        input_string = input_string.strip(separator)
+        
+        # Ensure the domain name is not empty
+        if not input_string:
+            input_string = "example"  # You can provide a default name
+        
+        return input_string
 
 if __name__=="__main__":
     import argparse
@@ -1032,7 +1099,7 @@ if __name__=="__main__":
     parser_lic.add_argument("--trial", dest="trial", action="store_true")
 
     # parser for get_network command
-    parser_gnet = subparsers.add_parser('get_network', help='get a network')
+    parser_gnet = subparsers.add_parser('get_networks', help='get networks')
 
     # parser for deploy_network command
     parser_dnet = subparsers.add_parser('deploy_network', help='(re)deploy a network')
@@ -1077,7 +1144,7 @@ if __name__=="__main__":
     parser_ares = subparsers.add_parser('add_resource', help="add resource")
     parser_ares.add_argument('--site_id', dest="site_id")
     parser_ares.add_argument('--name', dest="name")
-    parser_ares.add_argument('--type', dest="type", nargs="?", default="fqdn_resource")
+    parser_ares.add_argument('--type', dest="type", nargs="?", default="fqdn_resource", choices=["fqdn_resource", "ipsubnet_resource", "wildcard_fqdn_resource"])
     parser_ares.add_argument('--protocols', dest="protocols", nargs="?", default=None)
     parser_ares.add_argument('--port_ranges', dest="port_ranges", nargs="?", default=None)
     parser_ares.add_argument('--ip', dest="ip", nargs="?", default=None)
@@ -1120,6 +1187,7 @@ if __name__=="__main__":
 
     # parser for get collaborations
     parser_gcol = subparsers.add_parser('get_collaborations', help="get collaborations")
+    parser_gcol.add_argument("--format", "-f", dest="format", nargs="?", default="txt")
 
     # parser for switch user
     parser_suser = subparsers.add_parser('switch_user', help="switch user")
@@ -1132,6 +1200,9 @@ if __name__=="__main__":
     # parser for logs
     parser_logs = subparsers.add_parser('logs', help="logs")
     parser_logs.add_argument(dest="router_id")
+
+    # parser for router list
+    parser_rlist = subparsers.add_parser('routers', help="router list")
 
     args = parser.parse_args()
 
@@ -1162,8 +1233,8 @@ if __name__=="__main__":
     if args.cmd == "license":
         ncm.license(args.macs, product_name=args.product, trial=args.trial)
     
-    if args.cmd == "get_network":
-        print(json.dumps(ncm.get_network()))
+    if args.cmd == "get_networks":
+        print(json.dumps(ncm.get_networks()))
     
     if args.cmd == "deploy_network":
         ncm.deploy_network(args.network_id)
@@ -1237,13 +1308,23 @@ if __name__=="__main__":
         print(json.dumps(ncm.get_user_attributes(nid=args.network_id)))
     
     if args.cmd == "get_collaborations":
-        print(json.dumps(ncm.get_collaborations()))
+        collabs = [c for c in ncm.get_collaborations() if c['type'] == 'tenant']
+        if args.format == "json":
+            print(json.dumps(collabs))
+        else:
+            for c in collabs:
+                print(f"{c['id']} - {c['attributes']['name']}")
     
     if args.cmd == "switch_user":
-        print(json.dumps(ncm.switch_user(tenant_id=args.tenant_id)))
+        print(json.dumps(ncm.switch_user(tenant_id=args.tenant_id, save=True)))
     
     if args.cmd == "remote_connect":
         ncm.remote_connect(rtr_id=args.router_id)
     
     if args.cmd == "logs":
         ncm.logs(router_id=args.router_id)
+    
+    if args.cmd == "routers":
+        rval = ncm.routers()
+        if rval:
+            print(json.dumps(rval))
