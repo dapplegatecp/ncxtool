@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-__version__ = '0.1.4'
+__version__ = '0.1.5'
 
 import argparse
 import html
@@ -96,10 +96,48 @@ class Ncm:
     def get_jwt(self):
         return self._get_jwt()
 
-    def get(self, url):
-        r = self.session.get(url)
+    def get(self, url, payload=None, params=None, headers=None):
+        kwargs = {
+            'json': payload,
+        }
+        if params:
+            kwargs['params'] = params
+        if headers:
+            kwargs['headers'] = headers
+
+        r = self.session.get(url, **kwargs)
         if not r.ok:
             LOGGER.error(f'GET {url} failed with status code {r.status_code}: {r.text}')
+            return None
+        return r.json()
+
+    def post(self, url, payload=None, params=None, headers=None):
+        kwargs = {
+            'json': payload,
+        }
+        if params:
+            kwargs['params'] = params
+        if headers:
+            kwargs['headers'] = headers
+
+        r = self.session.post(url, **kwargs)
+        if not r.ok:
+            LOGGER.error(f'POST {url} failed with status code {r.status_code}: {r.text}')
+            return None
+        return r.json()
+    
+    def put(self, url, payload=None, params=None, headers=None):
+        kwargs = {
+            'json': payload,
+        }
+        if params:
+            kwargs['params'] = params
+        if headers:
+            kwargs['headers'] = headers
+
+        r = self.session.put(url, **kwargs)
+        if not r.ok:
+            LOGGER.error(f'PUT {url} failed with status code {r.status_code}: {r.text}')
             return None
         return r.json()
 
@@ -231,7 +269,7 @@ class Ncm:
             return
         
         return rval
-    
+
     def get_network_id(self):
         net = self.get_network()
         if net:
@@ -292,11 +330,7 @@ class Ncm:
         return nid
 
     def deploy_network(self, nid=None):
-        if not nid:
-            LOGGER.info("NID empty")
-            nid = self.get_network_id()
-            if not nid:
-                raise Exception("No network found")
+        nid = self._netid(nid)
 
         r = self.session.post(self.ncm_api_networks_url + '/networks/%s/deploy?parentAccount=%s&tenantId=%s'%(nid, self.ncm_api_account, self.ncm_tenant_id))
         errors = []
@@ -314,14 +348,13 @@ class Ncm:
             errors.append(str(Argument))
         return errors
 
-    def delete_network(self, nid=None):
-        if not nid:
-            LOGGER.info("NID empty")
-            nid = self.get_network_id()
-            if not nid:
-                raise Exception("No network found")
+    def delete_network(self, force=False, nid=None):
+        nid = self._netid(nid)
 
         LOGGER.info("Deleting network id %s", nid )
+        if force:
+            LOGGER.info("Force delete network id %s", nid )
+            self.delete_all_sites(nid=nid, force=True)
         r = self.session.delete(self.ncm_api_networks_url + '/networks/%s' % nid)
         if not r.ok:
             LOGGER.error(" Error attempting to delete network%s (%s) %s", nid, r.status_code, r.text)
@@ -343,10 +376,10 @@ class Ncm:
         if lan_ips and not local_domains:
             local_domains = self._string_to_domain(site_name_pfx[0])
         
-        if local_domains and not isinstance(local_domains, list):
+        if not isinstance(local_domains, list):
             local_domains = [self._string_to_domain(f"{i if i else ''}{local_domains}") for i in range(len(rtr_ids))]
         
-        if lan_ips and not isinstance(lan_ips, list):
+        if not isinstance(lan_ips, list):
             lan_ips = [lan_ips] * len(rtr_ids)
 
         site_ids = []
@@ -359,11 +392,7 @@ class Ncm:
 
 
     def add_single_site(self, nid=None, site_name=None, rtr_id=None, local_domain=None, lan_ip=None):
-        if not nid:
-            LOGGER.info("NID empty")
-            nid = self.get_network_id()
-            if not nid:
-                raise Exception("No network found")
+        nid = self._netid(nid)
 
         device_ids = [rtr_id]
         payload = {
@@ -407,23 +436,29 @@ class Ncm:
 
         return siteid
 
-    def delete_single_site(self, siteid, nid=None):
+    def delete_site(self, site_ids, nid=None):
         params = {'parentAccount': self.ncm_api_account, 'tenantId' : self.ncm_tenant_id}
-        r = self.session.delete(self.ncm_api_networks_url + '/sites/%s'%siteid, params=params)
-        if not r.ok:
-            LOGGER.error("Failed to delete site (%s) for %s", r.status_code, siteid)
-            raise Exception("Failed to delete site (%s) for %s", r.status_code, siteid)
+        site_ids = site_ids if type(site_ids) == list else [site_ids]
+        for sid in site_ids:
+            r = self.session.delete(self.ncm_api_networks_url + '/sites/%s'%sid, params=params)
+            if not r.ok:
+                LOGGER.error("Failed to delete site (%s) for %s"%(r.status_code, sid))
         
         self.deploy_network(nid=nid)
 
-    def get_sites(self, sid=None, nid=None):
-        if not nid:
-            LOGGER.info("NID empty")
-            nid = self.get_network_id()
-            if not nid:
-                raise Exception("No network found")
+    def delete_all_sites(self, force=False, nid=None):
+        nid = self._netid(nid)
+        sids = [s['id'] for s in self.get_sites(nid=nid)]
+        if force:
+            # Delete all resources
+            for sid in sids:
+                self.delete_site_resources(site_id=sid, nid=nid)
+        self.delete_site(sids, nid=nid)
 
-        params = {'filter[network_id]':nid, 'parentAccount': self.ncm_api_account, 'tenantId' : self.ncm_tenant_id}
+    def get_sites(self, sid=None, nid=None):
+        nid = self._netid(nid)
+
+        params = {'filter[network_id]':nid, 'parentAccount': self.ncm_api_account, 'tenantId' : self.ncm_tenant_id, "page[size]":500}
         if sid:
             if not isinstance(sid, list):
                 sid = [sid]
@@ -432,11 +467,7 @@ class Ncm:
         return r.json()['data']
 
     def delete_site_resources(self, site_id, nid=None):
-        if not nid:
-            LOGGER.info("NID empty")
-            nid = self.get_network_id()
-            if not nid:
-                raise Exception("No network found")
+        nid = self._netid(nid)
 
         #Get site details
         params = {'filter[site_id]':site_id, 'parentAccount': self.ncm_api_account, 'tenantId' : self.ncm_tenant_id}
@@ -453,11 +484,7 @@ class Ncm:
         return True
 
     def delete_resource(self, resource_id, nid=None):
-        if not nid:
-            LOGGER.info("NID empty")
-            nid = self.get_network_id()
-            if not nid:
-                raise Exception("No network found")
+        nid = self._netid(nid)
 
         #Delete resource
         params = {'filter[network_id]':nid, 'parentAccount':self.ncm_api_account, 'tenantId':self.ncm_tenant_id}
@@ -468,13 +495,9 @@ class Ncm:
             raise Exception("Failed to delete resource (%s) for %s", r.status_code, resource_id)
 
     def delete_all_resources(self, nid=None):
-        if not nid:
-            LOGGER.info("NID empty")
-            nid = self.get_network_id()
-            if not nid:
-                raise Exception("No network found")
+        nid = self._netid(nid)
 
-        params = {'filter[network_id]':nid, 'parentAccount': self.ncm_api_account, 'tenantId' : self.ncm_tenant_id}
+        params = {'filter[network_id]':nid, 'parentAccount': self.ncm_api_account, 'tenantId' : self.ncm_tenant_id, "page[size]":500}
         r = requests.get(self.ncm_api_networks_url + '/sites', params=params)
 
         for net in r.json()["data"]:
@@ -482,11 +505,7 @@ class Ncm:
                 self.delete_site_resources(site_id=net["id"], nid=nid)
 
     def get_resources(self, sids=None, nid=None):
-        if not nid:
-            LOGGER.info("NID empty")
-            nid = self.get_network_id()
-            if not nid:
-                raise Exception("No network found")
+        nid = self._netid(nid)
 
         params = {'parentAccount': self.ncm_api_account, 'tenantId' : self.ncm_tenant_id, 'filter[network_id]':nid, "resource_template[is_null]":True, "page[size]":500}
         if sids:
@@ -499,11 +518,7 @@ class Ncm:
         return r.json().get("data", [])
 
     def add_resource(self, site_id, resource_name, resource_type, resource_protocols, resource_port_ranges, resource_ip, resource_domain, resource_static_prime_ip=None, resource_static_prime_ip_pool=None, nid=None):
-        if not nid:
-            LOGGER.info("NID empty")
-            nid = self.get_network_id()
-            if not nid:
-                raise Exception("No network found")
+        nid = self._netid(nid)
         
         def port_ranges(pr):
             if not pr: return None
@@ -538,11 +553,7 @@ class Ncm:
         return r.json().get("data", [])
     
     def get_policies(self, nid=None):
-        if not nid:
-            LOGGER.info("NID empty")
-            nid = self.get_network_id()
-            if not nid:
-                raise Exception("No network found")
+        nid = self._netid(nid)
 
         params = {"filter[network_id]":nid, 
                   "filter[type]": "access_control_policies",
@@ -559,11 +570,7 @@ class Ncm:
         return r.json()
 
     def add_policy(self, name="default", allow=False, from_site_ids=None, site_ips=None, user_attribute_id=None, user_attributes=None, to_site_ids=None, to_named_resources=None, order='after', nid=None):
-        if not nid:
-            LOGGER.info("NID empty")
-            nid = self.get_network_id()
-            if not nid:
-                raise Exception("No network found")
+        nid = self._netid(nid)
             
         # get the current policies, if one exists, we will do a put to update it, if none exists we need to do a post
         policies = self.get_policies(nid=nid)
@@ -581,11 +588,7 @@ class Ncm:
         return r
 
     def delete_policies(self, policy_ids=None, nid=None):
-        if not nid:
-            LOGGER.info("NID empty")
-            nid = self.get_network_id()
-            if not nid:
-                raise Exception("No network found")
+        nid = self._netid(nid)
 
         if not policy_ids:
             policies = self.get_policies(nid=nid)
@@ -787,10 +790,7 @@ class Ncm:
         return policy
 
     def delete_policy_rule(self, policy_rule_id, nid=None):
-        if not nid:
-            nid = self.get_network_id()
-            if not nid:
-                raise Exception("No network found")
+        nid = self._netid(nid)
         
         policies = self.get_policies(nid=nid)
         if policies.get("data", []):
@@ -813,11 +813,7 @@ class Ncm:
                 return r.json()
 
     def get_user_attributes(self, nid=None):
-        if not nid:
-            LOGGER.info("NID empty")
-            nid = self.get_network_id()
-            if not nid:
-                raise Exception("No network found")
+        nid = self._netid(nid)
         params = {'filter[network_id]':nid, 'parentAccount': self.ncm_api_account, 'tenantId' : self.ncm_tenant_id}
         r = self.session.get(self.ncm_api_ncx_auth_url+'/user_attributes', params=params)
         return r.json().get('data', [])
@@ -837,11 +833,17 @@ class Ncm:
         r = self.session.put(ncm_api, json=initial, headers={"Content-Type":"application/json"})
         r.raise_for_status()
 
+        try:
+            data = r.json()['data'][0]
+        except (KeyError, IndexError):
+            raise Exception(f"data not found: {r.text}")
+        if not data['success']:
+            raise Exception(data['reason'])
+
         term = Terminal()
 
-        print(r.json()['data'][0]['data']['k'], end='', flush=True)
-
         with term.cbreak():
+            print(data['data']['k'], end='', flush=True)
             interrupt = False
             while True:
                 kill = False
@@ -877,7 +879,7 @@ class Ncm:
         print("\nExiting...")
 
     def logs(self, router_id, format='txt'):
-        r = self.session.get('https://www.cradlepointecm.com/api/v1/remote/status/log/', params={'id': router_id})
+        r = self.session.get(self.ncm_api.url + '/remote/status/log/', params={'id': router_id})
         if format == 'json':
             return r.json()['data'][0]['data']
         else:
@@ -891,14 +893,30 @@ class Ncm:
                 print(", ".join([timestamp, level, system, message]))
         return r.text
 
-    def routers(self, format='txt'):
-        r = self.session.get('https://www.cradlepointecm.com/api/v1/routers/?expand=group,product&limit=500')
+    def routers(self, format='txt', expand='group,product'):
+        r = self.session.get(self.ncm_api_url + f'/routers/?{"expand=" + expand + "&" if expand else ""}limit=500')
+        if not r.ok:
+            LOGGER.error("Failed to get routers (%s).....(%s)", r.status_code, r.text)
+            return
+        
+        data = r.json()['data']
+        meta = r.json()['meta']
+        offset = 0
+        while (offset + 500) < meta['total_count']:
+            offset += 500
+            r = self.session.get(self.ncm_api_url + f'/routers/?{"expand=" + expand + "&" if expand else ""}limit=500&offset={offset}')
+            if not r.ok:
+                LOGGER.error("Failed to get routers (%s).....(%s)", r.status_code, r.text)
+                return
+            data.extend(r.json()['data'])
+            meta = r.json()['meta']
+
         if format == 'json':
-            return r.json()['data']
+            return data
         else:
-            print("router_id,name,group,product")
-            for router in r.json()['data']:
-                print(f"{router['id']},{router['name']},{router['group']['name'] if router.get('group') else ''},{router['product']['name'] if router.get('product') else ''}")
+            print("router_id,name,group,product,mac,ip")
+            for router in data:
+                print(f"{router['id']},{router['name']},{router['group']['name'] if router.get('group') else ''},{router['product']['name'] if router.get('product') else ''},{router['mac']},{router.get('ip_address') or ''}")
 
 
     def _is_mystack(self, stack):
@@ -1076,6 +1094,14 @@ class Ncm:
         
         return input_string
 
+    def _netid(self, nid=None):
+        if not nid:
+            LOGGER.info("NID empty")
+            nid = self.get_network_id()
+            if not nid:
+                raise Exception("No network found")
+        return nid
+
 if __name__=="__main__":
     import argparse
     parser = argparse.ArgumentParser()
@@ -1107,7 +1133,7 @@ if __name__=="__main__":
 
     # parser for network command
     parser_net = subparsers.add_parser('create_network', help='create a network')
-    parser_net.add_argument("--name", dest="name")
+    parser_net.add_argument("--name", dest="name", default="Default Network")
     parser_net.add_argument("--primary_id", dest="primary_id", type=int)
     parser_net.add_argument("--secondary_id", dest="secondary_id", nargs="?", type=int)
     parser_net.add_argument("--primary_ip", dest="primary_ip")
@@ -1116,6 +1142,7 @@ if __name__=="__main__":
     # parser for delete_network command
     parser_delnet = subparsers.add_parser('delete_network', help='delete a network')
     parser_delnet.add_argument(dest="network_id", nargs="?")
+    parser_delnet.add_argument("--force", dest="force", action="store_true")
 
     # parser for add site command
     parser_asite = subparsers.add_parser('add_site', help="add a site")
@@ -1125,7 +1152,7 @@ if __name__=="__main__":
 
     # parser for delete_site command
     parser_dsite = subparsers.add_parser('delete_site', help="delete a site")
-    parser_dsite.add_argument("--site_id", dest="site_id")
+    parser_dsite.add_argument("--site_id", dest="site_id", nargs="+")
 
     # parser for get_sites command
     parser_gsite = subparsers.add_parser('get_sites', help="get sites")
@@ -1218,7 +1245,7 @@ if __name__=="__main__":
         password = os.environ.get("NCM_PASSWORD")
     if not username or not password:
         raise Exception("Must provide username and password, either by using -l or setting NCM_USERNAME and NCM_PASSWORD environment variables")
-    LOGGER.info(f"Username:{username} Password:{password}")
+    LOGGER.info(f"Username:{username} Password:{len(password)*'*'}")
     ncm = Ncm(username, password, stack=args.s)
 
     if args.a:
@@ -1240,24 +1267,24 @@ if __name__=="__main__":
         ncm.deploy_network(args.network_id)
     
     if args.cmd == "delete_network":
-        ncm.delete_network(args.network_id)
+        ncm.delete_network(nid=args.network_id, force=args.force)
 
     if args.cmd == "create_network":
 
-        LOGGER.info(f"network_name={args.network_name},primary_id={args.network_primary_id},secondary_id={args.network_secondary_id},primary_ip={args.network_primary_ip},secondary_ip={args.network_secondary_ip}")
+        LOGGER.info(f"network_name={args.name},primary_id={args.primary_id},secondary_id={args.secondary_id},primary_ip={args.primary_ip},secondary_ip={args.secondary_ip}")
 
-        print(ncm.create_network(network_name=args.network_name,
-            primary_id=args.network_primary_id,
-            secondary_id=args.network_secondary_id,
-            primary_ip=args.network_primary_ip,
-            secondary_ip=args.network_secondary_ip))
+        print(ncm.create_network(network_name=args.name,
+            primary_id=args.primary_id,
+            secondary_id=args.secondary_id,
+            primary_ip=args.primary_ip,
+            secondary_ip=args.secondary_ip))
     
     if args.cmd == "add_site":
         LOGGER.info('router ids: %s', args.router_id)
-        print(ncm.add_sites(args.site_name, args.router_id, args.network_id))
+        print(ncm.add_sites(args.name, args.router_id, args.network_id))
 
     if args.cmd == "delete_site":
-        ncm.delete_single_site(args.site_id)
+        ncm.delete_site(args.site_id)
 
     if args.cmd == "get_sites":
         print(json.dumps(ncm.get_sites(nid=args.network_id)))
